@@ -1,6 +1,6 @@
 # NATS Agent Protocol
 
-**Version:** 0.1.0-draft
+**Version:** 0.2.0-draft
 **Status:** Draft
 **Date:** 2026-04-21
 
@@ -15,7 +15,7 @@ Built on two NATS primitives:
 
 Anything NATS already provides is used as-is. The protocol adds only what is missing: a subject convention, one shared service name, a request envelope, a streaming response wrapper, and a liveness beacon.
 
-Out of scope for v0.1:
+Out of scope for v0.2:
 
 - End-to-end encryption and strong agent identity.
 - The `attachments` endpoint (§2 reserves the subject; §5.5 sketches intent).
@@ -29,7 +29,7 @@ Normative keywords — **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, **MAY
 
 ### 1.2 Version
 
-This specification is version `0.1.0-draft`. Agents declare the protocol version they implement in service metadata (§3.2). Compatibility rules are in §11.
+This specification is version `0.2.0-draft`. Agents declare the protocol version they implement in service metadata (§3.2). Compatibility rules are in §11.
 
 ---
 
@@ -61,7 +61,7 @@ What the protocol fixes for endpoints is the endpoint **name**, not its subject:
 - An agent MUST register an endpoint named `prompt`.
 - If the agent exposes the future artifact endpoint, it MUST be named `attachments`.
 
-Callers therefore MUST learn endpoint subjects from `$SRV.INFO.Synadia Agents` (§4); they MUST NOT construct endpoint subjects from identity alone. The heartbeat subject is the one exception — it is fixed so callers can subscribe to `agents.*.*.*.heartbeat` without a lookup.
+Callers therefore MUST learn endpoint subjects from `$SRV.INFO.agents` (§4); they MUST NOT construct endpoint subjects from identity alone. The heartbeat subject is the one exception — it is fixed so callers can subscribe to `agents.*.*.*.heartbeat` without a lookup.
 
 ### 2.1 Prompt endpoint metadata
 
@@ -110,7 +110,7 @@ agents.*.*.summarizer                # every agent root named "summarizer"
 agents.*.*.*.heartbeat               # every heartbeat beacon (protocol-fixed subject)
 ```
 
-Note: there is no `agents.*.*.*.prompt`-style wildcard for endpoints. Endpoint subjects are agent-chosen — use `$SRV.PING.Synadia Agents` (§4) to enumerate instead.
+Note: there is no `agents.*.*.*.prompt`-style wildcard for endpoints. Endpoint subjects are agent-chosen — use `$SRV.PING.agents` (§4) to enumerate instead.
 
 Full-form and abbreviated subject tokens do not cross-match under a NATS wildcard. A deployment SHOULD commit to one convention per `metadata.agent` value.
 
@@ -124,7 +124,7 @@ Every agent MUST register as a NATS micro service using `@nats-io/services` or e
 
 | Field         | Value                                                                                                                                                       |
 |---------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `name`        | MUST be `Synadia Agents`. Acts as the discovery filter that separates compliant agents from other NATS micro services. If a framework rejects the space, `SynadiaAgents` is treated as equivalent. |
+| `name`        | MUST be `agents`. Acts as the discovery filter that separates compliant agents from other NATS micro services.                                               |
 | `version`     | Semver of the harness implementation (not the protocol). Example: `1.4.0`.                                                                                  |
 | `description` | Human-readable description surfaced by `nats micro list` / `nats micro info`.                                                                               |
 | `metadata`    | Object. See §3.2.                                                                                                                                           |
@@ -138,7 +138,7 @@ The service `metadata` object MUST include:
   "agent": "claude-code",
   "owner": "aconnolly",
   "session": "synadia-com-2",
-  "protocol_version": "0.1"
+  "protocol_version": "0.2"
 }
 ```
 
@@ -153,9 +153,20 @@ The instance name is not echoed in metadata — callers read it from the 4th tok
 
 Additional metadata keys MAY be included and MUST be preserved by tools that relay service info.
 
-### 3.3 Multiple instances
+### 3.3 Queue group on the `prompt` endpoint
 
-Multiple physical instances of the same logical agent MAY register simultaneously. They share `agent`/`owner`/`name` identity, which yields identical endpoint subjects, which causes the NATS micro service framework to load-balance requests across them via queue groups.
+The `prompt` endpoint MUST be registered with a NATS queue group of `"agents"`. This:
+
+- Enables load-balancing across same-subject instances (§3.4) without per-deployment coordination.
+- Makes the queue group discoverable at runtime — the micro service framework reports it in `$SRV.INFO` as `endpoints[].queue_group`.
+
+In `@nats-io/services` (TypeScript) this is `addEndpoint("prompt", { subject, handler, queue: "agents", metadata })`; equivalent mechanisms exist in other clients. Do NOT rely on the framework's default queue group — that value differs between implementations, which breaks interoperability across mixed-SDK deployments.
+
+The heartbeat subject (§8) has no queue group — it is pub/sub.
+
+### 3.4 Multiple instances
+
+Multiple physical instances of the same logical agent MAY register simultaneously. They share `agent`/`owner`/`name` identity, which yields identical endpoint subjects, and the `"agents"` queue group on the `prompt` endpoint (§3.3) causes the NATS micro service framework to load-balance requests across them.
 
 Each instance is distinguished by the service `id` (per-instance, framework-assigned). This id also appears in heartbeat payloads as `instance_id` (§8.3).
 
@@ -167,18 +178,18 @@ Different instances of the same logical agent SHOULD expose identical endpoints 
 
 The protocol defines exactly **two stable subjects** for discovery:
 
-| Purpose | Subject                                   | Semantics                                                 |
-|---------|-------------------------------------------|-----------------------------------------------------------|
-| General | `$SRV.PING.Synadia Agents`                | Every compliant agent instance responds once.             |
-| Direct  | `$SRV.INFO.Synadia Agents.{instance_id}`  | One specific instance responds with full service info.    |
+| Purpose | Subject                          | Semantics                                                 |
+|---------|----------------------------------|-----------------------------------------------------------|
+| General | `$SRV.PING.agents`               | Every compliant agent instance responds once.             |
+| Direct  | `$SRV.INFO.agents.{instance_id}` | One specific instance responds with full service info.    |
 
 Discovery returns each instance's endpoints with their subjects and metadata. Callers MUST use the `subject` field from the discovery record to address an endpoint — endpoint subjects are not protocol-fixed (§2) and cannot be reliably constructed from identity alone.
 
 ### 4.1 General discovery
 
 ```shell
-nats req '$SRV.PING.Synadia Agents' '' --replies=0 --timeout=2s
-nats req '$SRV.INFO.Synadia Agents' '' --replies=0 --timeout=2s
+nats req '$SRV.PING.agents' '' --replies=0 --timeout=2s
+nats req '$SRV.INFO.agents' '' --replies=0 --timeout=2s
 ```
 
 `$SRV.PING` returns ping-level records; `$SRV.INFO` returns full records including endpoint capability metadata. Callers typically use the latter.
@@ -188,7 +199,7 @@ nats req '$SRV.INFO.Synadia Agents' '' --replies=0 --timeout=2s
 Callers with a known `instance_id`:
 
 ```shell
-nats req '$SRV.INFO.Synadia Agents.VMKS6MHK71PCPWGY38A7N5' '' --timeout=2s
+nats req '$SRV.INFO.agents.VMKS6MHK71PCPWGY38A7N5' '' --timeout=2s
 ```
 
 Callers with a known identity tuple but no `instance_id` run general discovery and filter client-side on `metadata.agent`, `metadata.owner`, and the 4th token of the endpoint subject.
@@ -480,14 +491,14 @@ Callers MUST tolerate additional unknown fields.
 For point-in-time reachability, callers SHOULD use the micro service ping instead of waiting for the next heartbeat:
 
 ```shell
-nats req '$SRV.PING.Synadia Agents' '' --replies=0 --timeout=2s
+nats req '$SRV.PING.agents' '' --replies=0 --timeout=2s
 ```
 
 Callers correlate ping responses with heartbeats via `instance_id`.
 
 ### 8.5 Subscribe-before-discover
 
-To avoid a race between enumeration and the first heartbeat, callers SHOULD subscribe to the heartbeat wildcard (`agents.*.*.*.heartbeat`, scoped as narrowly as needed) **before** sending their first `$SRV.PING.Synadia Agents`.
+To avoid a race between enumeration and the first heartbeat, callers SHOULD subscribe to the heartbeat wildcard (`agents.*.*.*.heartbeat`, scoped as narrowly as needed) **before** sending their first `$SRV.PING.agents`.
 
 ### 8.6 Shutdown
 
@@ -582,36 +593,37 @@ The 0.x line is explicitly unstable. MINOR bumps within 0.x MAY break compatibil
 
 ### 11.3 Known versions
 
-| Version | Status | Notes          |
-|---------|--------|----------------|
-| `0.1`   | Draft  | This document. |
+| Version | Status     | Notes          |
+|---------|------------|----------------|
+| `0.2`   | Draft      | This document. |
+| `0.1`   | Superseded | Early draft — service name was `Synadia Agents`, no required queue group on the `prompt` endpoint. Not wire-compatible with 0.2. |
 
 ---
 
 ## 12. Implementation checklist
 
-An **agent** is compliant with protocol `0.1` when it:
+An **agent** is compliant with protocol `0.2` when it:
 
-- Registers as a NATS micro service with `name = "Synadia Agents"` (or `SynadiaAgents` if the framework rejects the space).
-- Declares `metadata.agent`, `metadata.owner`, `metadata.protocol_version = "0.1"`; adds `metadata.session` when session-aware.
-- Registers an endpoint named `prompt` with endpoint metadata `max_payload` and `attachments_ok`. The endpoint's `subject` is agent-chosen; the recommended default (used by channel plugins) is `agents.{agent}.{owner}.{name}`.
+- Registers as a NATS micro service with `name = "agents"`.
+- Declares `metadata.agent`, `metadata.owner`, `metadata.protocol_version = "0.2"`; adds `metadata.session` when session-aware.
+- Registers an endpoint named `prompt` with queue group `"agents"` (§3.3) and endpoint metadata `max_payload` and `attachments_ok`. The endpoint's `subject` is agent-chosen; the recommended default (used by channel plugins) is `agents.{agent}.{owner}.{name}`.
 - On the `prompt` endpoint:
   - Accepts both JSON envelopes and the plain-text shorthand (§5).
   - Rejects malformed envelopes, empty payloads, invalid base64, oversize requests, and attachments-when-`attachments_ok=false` with status `400`.
   - Tolerates and preserves unknown envelope fields.
   - Emits response streams per §6: typed `{type, data}` chunks in publication order, terminated by a zero-byte headerless message. Errors precede the terminator with error headers.
 - Publishes heartbeats on `agents.{agent}.{owner}.{name}.heartbeat` at its configured cadence with all §8.3 fields.
-- Responds to `$SRV.PING.Synadia Agents` and `$SRV.INFO.Synadia Agents` via the micro service framework.
+- Responds to `$SRV.PING.agents` and `$SRV.INFO.agents` via the micro service framework.
 - If it issues mid-stream queries: conforms to §7.
 - Uses `respondError` per §9 for errors; `Nats-Service-Error-Code` is set from the §9.2 taxonomy.
 
 A **caller** is compliant when it:
 
-- Performs discovery only via `$SRV.PING.Synadia Agents` and `$SRV.INFO.Synadia Agents[.{instance_id}]`.
+- Performs discovery only via `$SRV.PING.agents` and `$SRV.INFO.agents[.{instance_id}]`.
 - Reads each instance's `metadata.protocol_version` and applies §11.2 compatibility rules.
 - Locates the `prompt` endpoint by `endpoints[].name == "prompt"`, reads its metadata, and enforces `max_payload` / `attachments_ok` locally before publishing (§5.4).
-- Publishes to the `prompt` endpoint's `subject` as reported by `$SRV.INFO.Synadia Agents`. MUST NOT construct the subject from identity alone.
-- Subscribes to an appropriate heartbeat wildcard **before** initial `$SRV.PING.Synadia Agents`.
+- Publishes to the `prompt` endpoint's `subject` as reported by `$SRV.INFO.agents`. MUST NOT construct the subject from identity alone.
+- Subscribes to an appropriate heartbeat wildcard **before** initial `$SRV.PING.agents`.
 - Applies a per-stream inactivity timeout (§6.6).
 - Inspects NATS headers (`Nats-Service-Error-Code`) on every received message before interpreting the body.
 - Treats a zero-byte body with no NATS headers as stream termination (§6.5).
@@ -630,7 +642,7 @@ agents.{agent}.{owner}.{name}.heartbeat         # liveness beacon  (protocol-fix
 agents.{agent}.{owner}.{name}.attachments       # default subject for future `attachments` endpoint
 
 # Endpoint subjects are agent-chosen — the two entries above are channel-plugin defaults, not
-# mandatory. Callers learn actual endpoint subjects from $SRV.INFO.Synadia Agents.
+# mandatory. Callers learn actual endpoint subjects from $SRV.INFO.agents.
 
 # Wildcards
 agents.>                                        # all agent traffic
@@ -640,9 +652,9 @@ agents.*.*.{name}                               # all agent roots with this inst
 agents.*.*.*.heartbeat                          # all heartbeats (protocol-fixed subject)
 
 # Discovery — the only two stable subjects the protocol requires callers to know
-$SRV.PING.Synadia Agents                        # enumerate compliant agents (multi-response)
-$SRV.INFO.Synadia Agents                        # full service info per instance (multi-response)
-$SRV.INFO.Synadia Agents.{instance_id}          # full service info for a specific instance
+$SRV.PING.agents                                # enumerate compliant agents (multi-response)
+$SRV.INFO.agents                                # full service info per instance (multi-response)
+$SRV.INFO.agents.{instance_id}                  # full service info for a specific instance
 ```
 
 ---
@@ -751,11 +763,11 @@ Published to `agents.claude-code.aconnolly.synadia-com-2.heartbeat`:
 
 ### B.12 Service info response
 
-Returned by `$SRV.INFO.Synadia Agents` (one response per instance):
+Returned by `$SRV.INFO.agents` (one response per instance):
 
 ```json
 {
-  "name": "Synadia Agents",
+  "name": "agents",
   "id": "VMKS6MHK71PCPWGY38A7N5",
   "version": "0.0.1",
   "description": "Claude Code — synadia-com-2",
@@ -763,13 +775,13 @@ Returned by `$SRV.INFO.Synadia Agents` (one response per instance):
     "agent": "claude-code",
     "owner": "aconnolly",
     "session": "synadia-com-2",
-    "protocol_version": "0.1"
+    "protocol_version": "0.2"
   },
   "endpoints": [
     {
       "name": "prompt",
       "subject": "agents.claude-code.aconnolly.synadia-com-2",
-      "queue_group": "",
+      "queue_group": "agents",
       "metadata": {
         "max_payload": "1MB",
         "attachments_ok": true
