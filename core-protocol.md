@@ -1,6 +1,6 @@
 # NATS Agent Protocol
 
-**Version:** 0.3.0-draft
+**Version:** 0.3.0
 **Status:** Draft
 **Date:** 2026-04-28
 
@@ -29,7 +29,7 @@ Normative keywords - **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, **MAY**
 
 ### 1.2 Version
 
-This specification is version `0.3.0-draft`. Agents declare the protocol version they implement in service metadata (§3.2). Compatibility rules are in §11.
+This specification is version `0.3.0`. Agents declare the protocol version they implement in service metadata (§3.2). Compatibility rules are in §11.
 
 v0.3 introduced two wire-breaking changes vs. v0.2:
 
