@@ -1,8 +1,8 @@
 # NATS Agent Protocol
 
-**Version:** 0.2.0-draft
+**Version:** 0.3.0-draft
 **Status:** Draft
-**Date:** 2026-04-21
+**Date:** 2026-04-28
 
 ## 1. Introduction
 
@@ -15,53 +15,63 @@ Built on two NATS primitives:
 
 Anything NATS already provides is used as-is. The protocol adds only what is missing: a subject convention, one shared service name, a request envelope, a streaming response wrapper, and a liveness beacon.
 
-Out of scope for v0.2:
+Out of scope for v0.3:
 
 - End-to-end encryption and strong agent identity.
-- The `attachments` endpoint (§2 reserves the subject; §5.5 sketches intent).
+- The `attachments` endpoint (§2 reserves the verb; §5.5 sketches intent).
 - JetStream-backed at-least-once streaming.
 
 ### 1.1 Conventions
 
-Normative keywords — **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, **MAY** — follow RFC 2119 and RFC 8174.
+Normative keywords - **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, **MAY** - follow RFC 2119 and RFC 8174.
 
 "The protocol" is the wire contract defined here. "SDKs" are language-specific libraries built on top, specified separately in `sdk-contract.md`.
 
 ### 1.2 Version
 
-This specification is version `0.2.0-draft`. Agents declare the protocol version they implement in service metadata (§3.2). Compatibility rules are in §11.
+This specification is version `0.3.0-draft`. Agents declare the protocol version they implement in service metadata (§3.2). Compatibility rules are in §11.
+
+v0.3 introduced two wire-breaking changes vs. v0.2:
+
+- **Verb-first subject hierarchy** (§2): each protocol endpoint owns its own positional slot via a `verb` token (`prompt`, `hb`, `status`, `attachments`) directly after the `agents.` root. v0.2 placed each endpoint on a sub-subject of the agent root; v0.3 hoists the verb up so endpoints don't share namespace with each other.
+- **`status` endpoint** (§8.7): a request/reply companion to the periodic heartbeat. Replies with the same JSON payload shape as a heartbeat, so callers can bootstrap their liveness tracker without waiting a full interval.
+
+There is no v0.2 ↔ v0.3 compatibility shim. Mixed-version deployments are allowed — they simply don't see each other on discovery, because the prompt subjects don't overlap.
 
 ---
 
 ## 2. Subject hierarchy
 
-Every agent instance occupies a subject tree rooted at:
+Every agent instance occupies a subject tree of the form:
 
 ```
-agents.{agent}.{owner}.{name}
+agents.{verb}.{agent}.{owner}.{name}
 ```
 
 | Token    | Role                                                                                                                                                                   |
 |----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `agents` | Fixed prefix. Reserved for this protocol.                                                                                                                              |
-| `agent`  | Identifier of the harness / runtime. SHOULD be (an abbreviation of) `metadata.agent` (§3.2). Conventional abbreviations: `ccc` for `claude-code`, `occ` for `openclaw` — see Appendix C. |
+| `verb`   | Endpoint discriminator. One of `prompt`, `hb`, `status`, `attachments` (see table below). Reserved for protocol use; agents MUST NOT use these tokens for any other purpose. |
+| `agent`  | Identifier of the harness / runtime. SHOULD be (an abbreviation of) `metadata.agent` (§3.2). Conventional abbreviations: `cc` for `claude-code`, `oc` for `openclaw` — see Appendix C. |
 | `owner`  | Operator or account owning the instance. SHOULD match `metadata.owner`.                                                                                                |
 | `name`   | Instance name within `{agent}/{owner}`. Lives only in the subject — not echoed in metadata.                                                                            |
 
-One subject under the root is **fixed by the protocol**: the heartbeat beacon. Endpoint subjects are agent-chosen; the channel plugins shipped with this protocol use the default subjects in the table, but SDK-authored agents MAY place their endpoints on any subject.
+The protocol reserves four verbs and assigns each a default subject. The endpoint **name** (used in `$SRV.INFO`) MUST match the verb token; the subject is open to overrides via `$SRV.INFO`, but the channels shipped with this protocol use the defaults.
 
-| Subject                                     | Purpose                                                              | Fixed?             |
-|---------------------------------------------|----------------------------------------------------------------------|--------------------|
-| `agents.{agent}.{owner}.{name}`             | Default subject for the required `prompt` endpoint (§5, §6).         | No — default only  |
-| `agents.{agent}.{owner}.{name}.heartbeat`   | Liveness beacon (§8).                                                | **Yes** (protocol-fixed) |
-| `agents.{agent}.{owner}.{name}.attachments` | Default subject for the future `attachments` endpoint (§5.5).        | No — default only  |
+| Verb          | Default subject                                  | Purpose                                                                          | Fixed?                   |
+|---------------|--------------------------------------------------|----------------------------------------------------------------------------------|--------------------------|
+| `prompt`      | `agents.prompt.{agent}.{owner}.{name}`           | Required prompt endpoint (§5, §6).                                               | No — default only        |
+| `hb`          | `agents.hb.{agent}.{owner}.{name}`               | Liveness beacon (§8). The verb is the abbreviation `hb` because heartbeat traffic dominates per-account subject volume. | **Yes** (protocol-fixed) |
+| `status`      | `agents.status.{agent}.{owner}.{name}`           | On-demand status request/reply (§8.7).                                           | No — default only        |
+| `attachments` | `agents.attachments.{agent}.{owner}.{name}`      | Reserved for the future chunked-upload endpoint (§5.5).                          | No — default only        |
 
 What the protocol fixes for endpoints is the endpoint **name**, not its subject:
 
 - An agent MUST register an endpoint named `prompt`.
+- An agent MUST register an endpoint named `status` (§8.7).
 - If the agent exposes the future artifact endpoint, it MUST be named `attachments`.
 
-Callers therefore MUST learn endpoint subjects from `$SRV.INFO.agents` (§4); they MUST NOT construct endpoint subjects from identity alone. The heartbeat subject is the one exception — it is fixed so callers can subscribe to `agents.*.*.*.heartbeat` without a lookup.
+Callers therefore MUST learn endpoint subjects from `$SRV.INFO.agents` (§4); they MUST NOT construct endpoint subjects from identity alone. The heartbeat subject is the one exception — it is fixed so callers can subscribe to `agents.hb.*.*.*` without a lookup.
 
 ### 2.1 Prompt endpoint metadata
 
@@ -92,25 +102,30 @@ Agent identifiers are not centrally registered. Collisions are the deployer's re
 ### 2.3 Examples
 
 ```
-agents.claude-code.aconnolly.synadia-com-2   # claude-code, session "synadia-com-2"
-agents.ccc.aconnolly.synadia-com-2           # same, using the "ccc" abbreviation
-agents.openclaw.rene.default                 # OpenClaw, long-running, session-less (name "default")
-agents.pi.mario.workspace-1                  # pi, session on workspace "workspace-1"
-agents.hermes.ops.summarizer                 # Hermes instance "summarizer"
+agents.prompt.claude-code.aconnolly.synadia-com-2   # prompt for claude-code, session "synadia-com-2"
+agents.prompt.cc.aconnolly.synadia-com-2            # same, using the "cc" abbreviation
+agents.hb.cc.aconnolly.synadia-com-2                # heartbeat for the same instance
+agents.status.cc.aconnolly.synadia-com-2            # status request/reply for the same instance
+agents.prompt.openclaw.rene.default                 # OpenClaw, long-running, session-less (name "default")
+agents.prompt.pi.mario.workspace-1                  # pi, session on workspace "workspace-1"
+agents.prompt.hermes.ops.summarizer                 # Hermes instance "summarizer"
 ```
 
 ### 2.4 Wildcard discovery
 
 ```
-agents.>                             # every agent on the system
-agents.claude-code.>                 # every claude-code agent (full form)
-agents.ccc.>                         # every claude-code agent (abbreviated form)
-agents.*.aconnolly.>                 # every agent owned by aconnolly
-agents.*.*.summarizer                # every agent root named "summarizer"
-agents.*.*.*.heartbeat               # every heartbeat beacon (protocol-fixed subject)
+agents.>                             # every protocol subject on the system
+agents.prompt.>                      # every prompt endpoint
+agents.hb.>                          # every heartbeat (equivalently: agents.hb.*.*.*)
+agents.status.>                      # every status endpoint
+agents.prompt.claude-code.>          # every claude-code prompt endpoint (full form)
+agents.prompt.cc.>                   # every claude-code prompt endpoint (abbreviated form)
+agents.prompt.*.aconnolly.>          # every prompt endpoint owned by aconnolly
+agents.prompt.*.*.summarizer         # every prompt endpoint with name "summarizer"
+agents.hb.*.*.*                      # every heartbeat beacon (protocol-fixed subject)
 ```
 
-Note: there is no `agents.*.*.*.prompt`-style wildcard for endpoints. Endpoint subjects are agent-chosen — use `$SRV.PING.agents` (§4) to enumerate instead.
+Each verb owns its own positional slot, so `agents.prompt.>` and `agents.hb.>` partition the namespace cleanly — heartbeats never compete with prompts under a wildcard subscription.
 
 Full-form and abbreviated subject tokens do not cross-match under a NATS wildcard. A deployment SHOULD commit to one convention per `metadata.agent` value.
 
@@ -138,18 +153,18 @@ The service `metadata` object MUST include:
   "agent": "claude-code",
   "owner": "aconnolly",
   "session": "synadia-com-2",
-  "protocol_version": "0.2"
+  "protocol_version": "0.3"
 }
 ```
 
 | Key                | Type   | Required             | Description                                                                                                                                                 |
 |--------------------|--------|----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `agent`            | string | Yes                  | Canonical harness identifier (e.g. `claude-code`). The 2nd subject token MAY be an abbreviation of this value (§2).                                         |
-| `owner`            | string | Yes                  | Operator / account. Matches the 3rd subject token.                                                                                                          |
+| `agent`            | string | Yes                  | Canonical harness identifier (e.g. `claude-code`). The 3rd subject token MAY be an abbreviation of this value (§2).                                         |
+| `owner`            | string | Yes                  | Operator / account. Matches the 4th subject token.                                                                                                          |
 | `session`          | string | When session-aware   | Harness-specific session label. MUST be set for session-aware harnesses (`claude-code`, `pi`, `hermes`); MAY be omitted or set to `"default"` for session-less harnesses (`openclaw`). |
 | `protocol_version` | string | Yes                  | Protocol version implemented. MUST match a MAJOR.MINOR value from §11.3.                                                                                    |
 
-The instance name is not echoed in metadata — callers read it from the 4th token of any endpoint subject.
+The instance name is not echoed in metadata — callers read it from the 5th token of any endpoint subject (§2).
 
 Additional metadata keys MAY be included and MUST be preserved by tools that relay service info.
 
@@ -158,11 +173,11 @@ Additional metadata keys MAY be included and MUST be preserved by tools that rel
 The `prompt` endpoint MUST be registered with a NATS queue group of `"agents"`. This:
 
 - Enables load-balancing across same-subject instances (§3.4) without per-deployment coordination.
-- Makes the queue group discoverable at runtime — the micro service framework reports it in `$SRV.INFO` as `endpoints[].queue_group`.
+- Makes the queue group discoverable at runtime - the micro service framework reports it in `$SRV.INFO` as `endpoints[].queue_group`.
 
-In `@nats-io/services` (TypeScript) this is `addEndpoint("prompt", { subject, handler, queue: "agents", metadata })`; equivalent mechanisms exist in other clients. Do NOT rely on the framework's default queue group — that value differs between implementations, which breaks interoperability across mixed-SDK deployments.
+In `@nats-io/services` (TypeScript) this is `addEndpoint("prompt", { subject, handler, queue: "agents", metadata })`; equivalent mechanisms exist in other clients. Do NOT rely on the framework's default queue group - that value differs between implementations, which breaks interoperability across mixed-SDK deployments.
 
-The heartbeat subject (§8) has no queue group — it is pub/sub.
+The heartbeat subject (§8) has no queue group - it is pub/sub.
 
 ### 3.4 Multiple instances
 
@@ -183,7 +198,7 @@ The protocol defines exactly **two stable subjects** for discovery:
 | General | `$SRV.PING.agents`               | Every compliant agent instance responds once.             |
 | Direct  | `$SRV.INFO.agents.{instance_id}` | One specific instance responds with full service info.    |
 
-Discovery returns each instance's endpoints with their subjects and metadata. Callers MUST use the `subject` field from the discovery record to address an endpoint — endpoint subjects are not protocol-fixed (§2) and cannot be reliably constructed from identity alone.
+Discovery returns each instance's endpoints with their subjects and metadata. Callers MUST use the `subject` field from the discovery record to address an endpoint - endpoint subjects are not protocol-fixed (§2) and cannot be reliably constructed from identity alone.
 
 ### 4.1 General discovery
 
@@ -212,7 +227,7 @@ From a service info record, a caller:
 2. Locates the `prompt` endpoint by `name == "prompt"` and reads its `subject` and its metadata (`max_payload`, `attachments_ok`).
 3. Derives the instance name from the 4th token of the endpoint's `subject` when the subject follows the default pattern (§2); otherwise the instance name is taken from the agent's `metadata.session` or is opaque to the caller.
 4. Enforces §5.4 validation using the endpoint metadata.
-5. Publishes requests to the endpoint's `subject` verbatim — no construction.
+5. Publishes requests to the endpoint's `subject` verbatim - no construction.
 
 ---
 
@@ -224,8 +239,8 @@ A request is a single NATS message sent by a caller to the agent's `prompt` endp
 
 A request payload is either:
 
-- **Plain UTF-8 text** — shorthand for an envelope with only the `prompt` field. Enables `nats req` use without constructing JSON.
-- **JSON envelope** — an object with at minimum a `prompt` field:
+- **Plain UTF-8 text** - shorthand for an envelope with only the `prompt` field. Enables `nats req` use without constructing JSON.
+- **JSON envelope** - an object with at minimum a `prompt` field:
 
 ```json
 {
@@ -275,9 +290,9 @@ Before publishing, the caller MUST enforce the `prompt` endpoint's capability me
 
 These local checks spare a round trip and agent-side resources. Agents MAY additionally enforce server-side and respond with `400`.
 
-### 5.5 Future direction: artifact endpoint (≥ 0.2)
+### 5.5 Future direction: artifact endpoint (≥ 0.3)
 
-A future revision will define the `attachments` endpoint at `agents.{agent}.{owner}.{name}.attachments` for large-file upload:
+A future revision will define the `attachments` endpoint at `agents.attachments.{agent}.{owner}.{name}` (v0.3 verb-first) for large-file upload:
 
 - Separate endpoint from `prompt`, with its own wire contract and request-side streaming (chunked uploads).
 - Uploaded files are staged in a temp directory accessible to the agent and injected by reference into the next `prompt` request's context.
@@ -300,12 +315,12 @@ The `prompt` endpoint responds by publishing a sequence of chunks to the caller'
 ```
 Caller                                    Agent
    |                                        |
-   | ——— request (reply=_INBOX.abc) ——————▶ |
+   | --- request (reply=_INBOX.abc) ------▶ |
    |                                        |
-   | ◀——  chunk 1 (to _INBOX.abc) ————————— |
-   | ◀——  chunk 2 (to _INBOX.abc) ————————— |
+   | ◀--  chunk 1 (to _INBOX.abc) --------- |
+   | ◀--  chunk 2 (to _INBOX.abc) --------- |
    |      ...                               |
-   | ◀——  terminator (to _INBOX.abc) ———————|
+   | ◀--  terminator (to _INBOX.abc) -------|
 ```
 
 ### 6.2 Chunk wrapper
@@ -366,7 +381,7 @@ The terminal `done` is not a `status` chunk. The empty-payload terminator (§6.5
 
 ### 6.5 Stream termination
 
-Every response stream MUST end with a **zero-byte body message carrying no NATS headers**. This is the uniform end-of-stream signal for all streams — successful or errored.
+Every response stream MUST end with a **zero-byte body message carrying no NATS headers**. This is the uniform end-of-stream signal for all streams - successful or errored.
 
 Agents MUST NOT publish further messages on the reply subject after the terminator.
 
@@ -378,7 +393,7 @@ A stream consisting of a single `response` chunk followed by the empty terminato
 
 ### 6.6 Ordering, delivery, forward compatibility
 
-Chunks are delivered in publication order. NATS core messaging is at-most-once; individual chunks — including the terminator — MAY be lost silently.
+Chunks are delivered in publication order. NATS core messaging is at-most-once; individual chunks - including the terminator - MAY be lost silently.
 
 To prevent indefinite hangs on a lost terminator, callers MUST apply a per-stream inactivity timeout. Recommended default: **60 seconds since the last observed chunk**. On timeout, the caller treats the stream as terminated with a transport error.
 
@@ -401,7 +416,7 @@ The protocol defines no cancellation signal. NATS subject delivery is interest-b
 
 ## 7. Mid-stream queries
 
-An agent MAY pause its response stream to ask the caller a question — a permission prompt, a clarification, a menu selection. The response stream remains open; the caller publishes one reply to a fresh subject supplied by the agent; the agent resumes emitting chunks.
+An agent MAY pause its response stream to ask the caller a question - a permission prompt, a clarification, a menu selection. The response stream remains open; the caller publishes one reply to a fresh subject supplied by the agent; the agent resumes emitting chunks.
 
 ### 7.1 Query chunk
 
@@ -425,7 +440,7 @@ An agent MAY pause its response stream to ask the caller a question — a permis
 
 ### 7.2 Reply
 
-The caller publishes exactly one message to `reply_subject`. Payload follows §5.1 — plain UTF-8 text, or a JSON envelope with `prompt` + optional `attachments`. No acknowledgment is defined.
+The caller publishes exactly one message to `reply_subject`. Payload follows §5.1 - plain UTF-8 text, or a JSON envelope with `prompt` + optional `attachments`. No acknowledgment is defined.
 
 ```shell
 nats pub _INBOX.Xj7k9Q2pA "yes"
@@ -447,8 +462,10 @@ Agents MUST publish a periodic heartbeat so callers can track liveness without p
 ### 8.1 Subject
 
 ```
-agents.{agent}.{owner}.{name}.heartbeat
+agents.hb.{agent}.{owner}.{name}
 ```
+
+The verb token is the abbreviation `hb` (not `heartbeat`) because heartbeat traffic dominates per-account subject volume — every agent instance emits at the configured cadence regardless of caller activity. The shorter token measurably reduces wire overhead at scale without sacrificing readability.
 
 Each instance publishes its own heartbeats to this subject. Callers distinguish instances by the `instance_id` field in the payload.
 
@@ -482,7 +499,7 @@ Agents SHOULD begin publishing heartbeats only after service registration is com
 | `ts`          | string | Yes                | UTC ISO 8601 timestamp of publication.                                                                                 |
 | `interval_s`  | number | Yes                | This instance's cadence in seconds. > 0; recommended ≥ 1.                                                              |
 
-The instance name is not duplicated into the payload — receivers extract it from the 4th token of the heartbeat's subject.
+The instance name is not duplicated into the payload — receivers extract it from the 5th token of the heartbeat's subject.
 
 Callers MUST tolerate additional unknown fields.
 
@@ -498,11 +515,36 @@ Callers correlate ping responses with heartbeats via `instance_id`.
 
 ### 8.5 Subscribe-before-discover
 
-To avoid a race between enumeration and the first heartbeat, callers SHOULD subscribe to the heartbeat wildcard (`agents.*.*.*.heartbeat`, scoped as narrowly as needed) **before** sending their first `$SRV.PING.agents`.
+To avoid a race between enumeration and the first heartbeat, callers SHOULD subscribe to the heartbeat wildcard (`agents.hb.*.*.*`, scoped as narrowly as needed) **before** sending their first `$SRV.PING.agents`.
 
 ### 8.6 Shutdown
 
-v0.1 defines no "going away" signal. Callers detect shutdown via the missed-beats threshold (§8.2).
+v0.3 defines no "going away" signal. Callers detect shutdown via the missed-beats threshold (§8.2).
+
+### 8.7 Status endpoint (request/reply)
+
+In addition to the periodic pub/sub heartbeat (§8.1–§8.3), every agent MUST expose a `status` endpoint:
+
+| Aspect           | Value                                                                    |
+|------------------|--------------------------------------------------------------------------|
+| Endpoint name    | `status`                                                                 |
+| Default subject  | `agents.status.{agent}.{owner}.{name}`                                   |
+| Queue group      | `"agents"` (same as `prompt`; see §3.3 — load-balances across same-identity instances) |
+| Request body     | Reserved. Agents MUST currently ignore the request body. Future revisions MAY define a request schema. |
+| Reply body       | A §8.3 heartbeat-shaped JSON payload, freshly built per request.         |
+
+The reply payload uses **exactly the §8.3 schema** — same `agent`, `owner`, optional `session`, `instance_id`, `ts`, `interval_s` fields. Receivers MAY treat a status reply as if it were a just-arrived heartbeat: feed it into the same liveness tracker, key on `instance_id`, etc.
+
+Two motivating use cases:
+
+1. **Bootstrap a tracker without waiting a full heartbeat interval.** A caller that just connected and wants point-in-time liveness for a known instance can `nats req agents.status.{agent}.{owner}.{name} ''` instead of waiting up to `interval_s` for the next pub/sub beat to arrive.
+2. **Future agent-state queries.** Subsequent revisions MAY extend the reply payload with richer agent metadata (cost so far, queue depth, capability hints, ...). Sourcing the reply from the same builder used for periodic heartbeats keeps the two streams in lockstep.
+
+#### 8.7.1 Implementation notes
+
+- Agents SHOULD source the reply payload from the same builder used to construct periodic heartbeats so the two emit identical values for fields they share.
+- A `respond` failure (broker dropped, request reply already torn down) is best-effort — agents MAY swallow it and continue serving.
+- An exception thrown while constructing the payload MUST be returned as a `Nats-Service-Error-Code: 500` response (see §9), not propagated into the framework's default handling.
 
 ---
 
@@ -514,8 +556,8 @@ Errors are reported using the NATS micro service error response mechanism.
 
 An error response carries two headers set by `respondError`:
 
-- `Nats-Service-Error-Code` — numeric status code as a string (e.g. `"429"`).
-- `Nats-Service-Error` — short human-readable description.
+- `Nats-Service-Error-Code` - numeric status code as a string (e.g. `"429"`).
+- `Nats-Service-Error` - short human-readable description.
 
 The body MAY be empty, or MAY carry a JSON object with richer context:
 
@@ -581,7 +623,7 @@ The protocol version an agent implements is declared in `metadata.protocol_versi
 
 ### 11.1 Version string format
 
-MAJOR.MINOR strings (e.g. `"0.1"`, `"1.0"`). Patch/pre-release qualifiers MAY be present but have no compatibility meaning — callers MUST compare only the MAJOR.MINOR prefix.
+MAJOR.MINOR strings (e.g. `"0.1"`, `"1.0"`). Patch/pre-release qualifiers MAY be present but have no compatibility meaning - callers MUST compare only the MAJOR.MINOR prefix.
 
 ### 11.2 Compatibility rules
 
@@ -595,24 +637,26 @@ The 0.x line is explicitly unstable. MINOR bumps within 0.x MAY break compatibil
 
 | Version | Status     | Notes          |
 |---------|------------|----------------|
-| `0.2`   | Draft      | This document. |
-| `0.1`   | Superseded | Early draft — service name was `Synadia Agents`, no required queue group on the `prompt` endpoint. Not wire-compatible with 0.2. |
+| `0.3`   | Draft      | This document. Verb-first subject hierarchy (§2 — `agents.{verb}.{a}.{o}.{n}`); heartbeat moves to `agents.hb.{a}.{o}.{n}` (§8.1); new `status` request/reply endpoint (§8.7) replies with the §8.3 heartbeat shape. Not wire-compatible with 0.2 — the prompt subject changed. |
+| `0.2`   | Superseded | Subject hierarchy was `agents.{a}.{o}.{n}` (4 tokens, no verb); heartbeat at `agents.{a}.{o}.{n}.heartbeat`; no `status` endpoint. |
+| `0.1`   | Superseded | Earliest draft — service name was `Synadia Agents`, no required queue group on the `prompt` endpoint. Not wire-compatible with 0.2. |
 
 ---
 
 ## 12. Implementation checklist
 
-An **agent** is compliant with protocol `0.2` when it:
+An **agent** is compliant with protocol `0.3` when it:
 
 - Registers as a NATS micro service with `name = "agents"`.
-- Declares `metadata.agent`, `metadata.owner`, `metadata.protocol_version = "0.2"`; adds `metadata.session` when session-aware.
-- Registers an endpoint named `prompt` with queue group `"agents"` (§3.3) and endpoint metadata `max_payload` and `attachments_ok`. The endpoint's `subject` is agent-chosen; the recommended default (used by channel plugins) is `agents.{agent}.{owner}.{name}`.
+- Declares `metadata.agent`, `metadata.owner`, `metadata.protocol_version = "0.3"`; adds `metadata.session` when session-aware.
+- Registers an endpoint named `prompt` with queue group `"agents"` (§3.3) and endpoint metadata `max_payload` and `attachments_ok`. The endpoint's `subject` is agent-chosen; the recommended default (used by channel plugins) is `agents.prompt.{agent}.{owner}.{name}` (§2 verb-first).
+- Registers an endpoint named `status` with queue group `"agents"` (§8.7). Default subject `agents.status.{agent}.{owner}.{name}`. Replies with a §8.3 heartbeat-shaped payload.
 - On the `prompt` endpoint:
   - Accepts both JSON envelopes and the plain-text shorthand (§5).
   - Rejects malformed envelopes, empty payloads, invalid base64, oversize requests, and attachments-when-`attachments_ok=false` with status `400`.
   - Tolerates and preserves unknown envelope fields.
   - Emits response streams per §6: typed `{type, data}` chunks in publication order, terminated by a zero-byte headerless message. Errors precede the terminator with error headers.
-- Publishes heartbeats on `agents.{agent}.{owner}.{name}.heartbeat` at its configured cadence with all §8.3 fields.
+- Publishes heartbeats on `agents.hb.{agent}.{owner}.{name}` at its configured cadence with all §8.3 fields.
 - Responds to `$SRV.PING.agents` and `$SRV.INFO.agents` via the micro service framework.
 - If it issues mid-stream queries: conforms to §7.
 - Uses `respondError` per §9 for errors; `Nats-Service-Error-Code` is set from the §9.2 taxonomy.
@@ -636,20 +680,23 @@ A **caller** is compliant when it:
 ## Appendix A: Subject quick reference
 
 ```
-# Identity and subjects (per §2)
-agents.{agent}.{owner}.{name}                   # identity root; default `prompt` endpoint subject
-agents.{agent}.{owner}.{name}.heartbeat         # liveness beacon  (protocol-fixed subject)
-agents.{agent}.{owner}.{name}.attachments       # default subject for future `attachments` endpoint
+# Identity and subjects (per §2 — verb-first, v0.3)
+agents.prompt.{agent}.{owner}.{name}            # default `prompt` endpoint subject (§5, §6)
+agents.hb.{agent}.{owner}.{name}                # liveness beacon (§8.1, protocol-fixed subject)
+agents.status.{agent}.{owner}.{name}            # default `status` endpoint subject (§8.7)
+agents.attachments.{agent}.{owner}.{name}       # default subject for future `attachments` endpoint (§5.5)
 
-# Endpoint subjects are agent-chosen — the two entries above are channel-plugin defaults, not
+# Endpoint subjects are agent-chosen — the entries above are channel-plugin defaults, not
 # mandatory. Callers learn actual endpoint subjects from $SRV.INFO.agents.
 
 # Wildcards
-agents.>                                        # all agent traffic
-agents.{agent}.>                                # all agents on a harness
-agents.*.{owner}.>                              # all agents for an owner
-agents.*.*.{name}                               # all agent roots with this instance name
-agents.*.*.*.heartbeat                          # all heartbeats (protocol-fixed subject)
+agents.>                                        # all protocol traffic
+agents.prompt.>                                 # all prompt endpoints
+agents.hb.>                                     # all heartbeats (= agents.hb.*.*.*; protocol-fixed)
+agents.status.>                                 # all status endpoints
+agents.prompt.{agent}.>                         # all prompt endpoints on a harness
+agents.prompt.*.{owner}.>                       # all prompt endpoints for an owner
+agents.prompt.*.*.{name}                        # all prompt endpoints with this instance name
 
 # Discovery — the only two stable subjects the protocol requires callers to know
 $SRV.PING.agents                                # enumerate compliant agents (multi-response)
@@ -665,7 +712,7 @@ JSON is shown formatted for readability; the wire uses compact UTF-8 encoding.
 
 ### B.1 Plain-text request
 
-Published to `agents.claude-code.aconnolly.synadia-com-2` (the channel-plugin default subject for the `prompt` endpoint — the actual subject comes from `$SRV.INFO`):
+Published to `agents.prompt.claude-code.aconnolly.synadia-com-2` (the channel-plugin default subject for the `prompt` endpoint, v0.3 verb-first — the actual subject comes from `$SRV.INFO`):
 
 ```
 summarize the attached report
@@ -703,7 +750,7 @@ Valid only when the endpoint's `attachments_ok` metadata is `true`.
 {"type":"response","data":{"text":"Hello, world."}}
 ```
 
-### B.6 Status chunk — `ack`
+### B.6 Status chunk - `ack`
 
 ```json
 {"type":"status","data":"ack"}
@@ -732,13 +779,13 @@ A NATS message with:
 - Zero-byte body.
 - No NATS headers.
 
-Published to the reply subject as the final message of every stream — successful or errored.
+Published to the reply subject as the final message of every stream - successful or errored.
 
 ### B.10 Error signal + terminator
 
 Error-terminated streams end with two messages.
 
-**Message 1** — error signal:
+**Message 1** - error signal:
 
 Headers:
 ```
@@ -751,14 +798,28 @@ Body (optional, per §9.1):
 {"error":"rate_limited","message":"Too many concurrent requests","retry_after_s":30}
 ```
 
-**Message 2** — the empty terminator (B.9).
+**Message 2** - the empty terminator (B.9).
 
 ### B.11 Heartbeat
 
-Published to `agents.claude-code.aconnolly.synadia-com-2.heartbeat`:
+Published to `agents.hb.claude-code.aconnolly.synadia-com-2` (v0.3 verb-first):
 
 ```json
-{"agent":"claude-code","owner":"aconnolly","session":"synadia-com-2","instance_id":"VMKS6MHK71PCPWGY38A7N5","ts":"2026-04-21T14:23:01Z","interval_s":30}
+{"agent":"claude-code","owner":"aconnolly","session":"synadia-com-2","instance_id":"VMKS6MHK71PCPWGY38A7N5","ts":"2026-04-28T14:23:01Z","interval_s":30}
+```
+
+### B.11a Status request / reply (v0.3 §8.7)
+
+Request — empty body to `agents.status.claude-code.aconnolly.synadia-com-2`:
+
+```
+(empty)
+```
+
+Reply — same JSON shape as a heartbeat (B.11), freshly built per request:
+
+```json
+{"agent":"claude-code","owner":"aconnolly","session":"synadia-com-2","instance_id":"VMKS6MHK71PCPWGY38A7N5","ts":"2026-04-28T14:23:01Z","interval_s":30}
 ```
 
 ### B.12 Service info response
@@ -769,23 +830,28 @@ Returned by `$SRV.INFO.agents` (one response per instance):
 {
   "name": "agents",
   "id": "VMKS6MHK71PCPWGY38A7N5",
-  "version": "0.0.1",
+  "version": "0.3.0",
   "description": "Claude Code — synadia-com-2",
   "metadata": {
     "agent": "claude-code",
     "owner": "aconnolly",
     "session": "synadia-com-2",
-    "protocol_version": "0.2"
+    "protocol_version": "0.3"
   },
   "endpoints": [
     {
       "name": "prompt",
-      "subject": "agents.claude-code.aconnolly.synadia-com-2",
+      "subject": "agents.prompt.claude-code.aconnolly.synadia-com-2",
       "queue_group": "agents",
       "metadata": {
         "max_payload": "1MB",
         "attachments_ok": true
       }
+    },
+    {
+      "name": "status",
+      "subject": "agents.status.claude-code.aconnolly.synadia-com-2",
+      "queue_group": "agents"
     }
   ]
 }
