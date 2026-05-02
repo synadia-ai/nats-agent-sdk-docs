@@ -865,9 +865,10 @@ Informative, not normative. Agent identifiers are not centrally registered (§2.
 
 | `metadata.agent` | Subject abbreviation | Harness / product            | Session semantics                                                                                          |
 |------------------|----------------------|------------------------------|------------------------------------------------------------------------------------------------------------|
-| `claude-code`    | `ccc`                | Anthropic's Claude Code CLI  | Session-aware. Each session SHOULD be its own registration; `metadata.session` carries the label.           |
-| `openclaw`       | `occ`                | OpenClaw agent runtime       | Session-less. `metadata.session` MAY be omitted or set to `"default"`. Instance name often `default`.       |
+| `claude-code`    | `cc`                 | Anthropic's Claude Code CLI  | Session-aware. Each session SHOULD be its own registration; `metadata.session` carries the label.           |
+| `openclaw`       | `oc`                 | OpenClaw agent runtime       | Session-less. `metadata.session` MAY be omitted or set to `"default"`. Instance name often `default`.       |
 | `pi`             | `pi`                 | `pi` agent harness           | Session-aware. Same convention as `claude-code`.                                                            |
 | `hermes`         | `hermes`             | Hermes agent harness         | Session-aware. Same convention as `claude-code`.                                                            |
+| `dspy`           | `dspy`               | DSPy / ax-llm ReAct agent    | Session-aware. Same convention as `claude-code`.                                                            |
 
 Additions to this table are non-normative; deployers SHOULD coordinate before claiming a new identifier to avoid collisions.
