@@ -371,9 +371,11 @@ Lifecycle signal emitted during long-running work. `data` is a string status tok
 
 v0.1 defines one status value:
 
-| Value | Meaning                                                                                                                              |
-|-------|--------------------------------------------------------------------------------------------------------------------------------------|
-| `ack` | Request accepted; work in progress. Resets the caller's inactivity timeout (§6.6). MAY be emitted periodically as a keep-alive.      |
+| Value | Meaning                                                                                                              |
+|-------|----------------------------------------------------------------------------------------------------------------------|
+| `ack` | Acknowledges request acceptance. Resets the caller's inactivity timeout (§6.6).                                       |
+
+Agents MUST emit exactly one `ack` status chunk as the **first message** on the reply subject, before any `response` or `query` chunks and before any work that introduces observable latency (e.g. a model call). The ack confirms the request was received and resets the caller's inactivity timeout (§6.6) ahead of any warm-up gap. This also makes the stream observable from generic NATS tooling (e.g. `nats req --wait-for-empty`) which would otherwise time out on the warm-up gap.
 
 Callers MUST silently ignore unrecognized status values.
 
@@ -655,6 +657,7 @@ An **agent** is compliant with protocol `0.3` when it:
   - Accepts both JSON envelopes and the plain-text shorthand (§5).
   - Rejects malformed envelopes, empty payloads, invalid base64, oversize requests, and attachments-when-`attachments_ok=false` with status `400`.
   - Tolerates and preserves unknown envelope fields.
+  - Emits an `{type:"status",data:"ack"}` chunk as the first message on the reply subject, before any `response`/`query` chunk and before any latency-inducing work (§6.4).
   - Emits response streams per §6: typed `{type, data}` chunks in publication order, terminated by a zero-byte headerless message. Errors precede the terminator with error headers.
 - Publishes heartbeats on `agents.hb.{agent}.{owner}.{name}` at its configured cadence with all §8.3 fields.
 - Responds to `$SRV.PING.agents` and `$SRV.INFO.agents` via the micro service framework.
@@ -756,7 +759,7 @@ Valid only when the endpoint's `attachments_ok` metadata is `true`.
 {"type":"status","data":"ack"}
 ```
 
-Emitted during long-running work as a keep-alive. Resets the caller's inactivity timeout (§6.6). The stream continues.
+The mandatory first chunk on every response stream (§6.4). Confirms request acceptance and resets the caller's inactivity timeout (§6.6). The stream continues with `response` chunks.
 
 ### B.7 Query chunk
 
