@@ -1,4 +1,4 @@
-# NATS Agent Protocol
+# Synadia Agent Protocol for NATS
 
 **Version:** 0.3.0
 **Status:** Draft

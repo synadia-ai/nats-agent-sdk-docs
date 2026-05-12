@@ -1,6 +1,6 @@
-# NATS Agents Protocol
+# Synadia Agent Protocol for NATS
 
-Documentation for the NATS Agents Protocol — a NATS-native protocol for
+Documentation for the Synadia Agent Protocol for NATS — a NATS-native protocol for
 identifying, discovering, and communicating with AI agents.
 
 ## Documents
